@@ -3,51 +3,69 @@ import os
 import ssl
 import socket
 import pandas as pd
-import psycopg2
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 import asyncio
 import argparse
 from datetime import datetime, timezone
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Timeout for network operations in seconds
 DEFAULT_TIMEOUT = 10
 
-def get_server_certificate(host, port):
-    """
-    Retrieve and parse the TLS certificate for a given host and port.
 
+import ipaddress
+
+def get_server_certificate(host: str, port: int) -> tuple:
+    """
+    Retrieves the server certificate from the given host and port.
     Args:
-        host (str): The hostname or IP address.
-        port (int): The port number.
-
+        host (str): Hostname or IP address of the server.
+        port (int): Port number.
     Returns:
-        tuple: A tuple containing host, port, and the parsed certificate as a dictionary, or an error message if an exception occurs.
+        tuple: A tuple containing the host, port, parsed certificate details, and timestamp.
     """
+    # Determine IP address version
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.version == 4:
+            af = socket.AF_INET
+        elif ip.version == 6:
+            af = socket.AF_INET6
+    except ValueError:
+        af = socket.AF_INET  # Default to AF_INET if host is not a valid IP address
+
     context = ssl.create_default_context()
     context.check_hostname = False
-    conn = context.wrap_socket(socket.socket(socket.AF_INET), server_hostname=host)
+    conn = context.wrap_socket(socket.socket(af), server_hostname=host)
     conn.settimeout(DEFAULT_TIMEOUT)
+    last_checked = datetime.now(timezone.utc)  # Timestamp for when the check was done
+
     try:
         conn.connect((host, port))
         cert = conn.getpeercert(binary_form=False)
         parsed_cert = parse_certificate(cert)
-        return (host, port, parsed_cert)
+        return (host, port, parsed_cert, last_checked)
     except Exception as e:
-        return (host, port, str(e))
+        return (host, port, str(e), last_checked)
     finally:
         conn.close()
 
-def parse_certificate(cert):
-    """
-    Parse a TLS certificate into a dictionary with useful fields.
 
+def parse_certificate(cert: dict) -> dict:
+    """
+    Parses the certificate dictionary into a more structured format.
     Args:
-        cert (dict): The TLS certificate as a dictionary.
-
+        cert (dict): The certificate dictionary.
     Returns:
-        dict: A dictionary with parsed certificate details or the original certificate if it's not a dictionary.
+        dict: A dictionary with parsed certificate details.
     """
+
     def tuple_to_dict(tuples):
-        """Convert a list of tuples into a dictionary."""
         result = {}
         for t in tuples:
             for k, v in t:
@@ -60,170 +78,173 @@ def parse_certificate(cert):
                     result[k] = v
         return result
 
-    subject_dict = tuple_to_dict(cert.get('subject', []))
-    common_name = subject_dict.get('commonName', '')
-    
-    if isinstance(cert, dict):
-        return {
-            'subject': format_dict(subject_dict),
-            'commonName': common_name,
-            'issuer': format_dict(tuple_to_dict(cert.get('issuer', []))),
-            'version': cert.get('version'),
-            'serialNumber': cert.get('serialNumber'),
-            'notBefore': cert.get('notBefore'),
-            'notAfter': cert.get('notAfter'),
-            'subjectAltName': format_tuple_list(cert.get('subjectAltName')),
-            'OCSP': format_list(cert.get('OCSP')),
-            'caIssuers': format_list(cert.get('caIssuers')),
-            'crlDistributionPoints': format_list(cert.get('crlDistributionPoints'))
-        }
-    return cert
+    subject_dict = tuple_to_dict(cert.get("subject", []))
+    common_name = subject_dict.get("commonName", "")
+    not_before = datetime.strptime(
+        cert.get("notBefore"), "%b %d %H:%M:%S %Y %Z"
+    ).replace(tzinfo=timezone.utc)
+    not_after = datetime.strptime(cert.get("notAfter"), "%b %d %H:%M:%S %Y %Z").replace(
+        tzinfo=timezone.utc
+    )
 
-def format_dict(d):
+    return {
+        "subject": format_dict(subject_dict),
+        "commonName": common_name,
+        "issuer": format_dict(tuple_to_dict(cert.get("issuer", []))),
+        "version": cert.get("version"),
+        "serialNumber": cert.get("serialNumber"),
+        "notBefore": not_before,
+        "notAfter": not_after,
+        "subjectAltName": format_tuple_list(cert.get("subjectAltName")),
+        "OCSP": format_list(cert.get("OCSP")),
+        "caIssuers": format_list(cert.get("caIssuers")),
+        "crlDistributionPoints": format_list(cert.get("crlDistributionPoints")),
+    }
+
+
+def format_dict(d: dict) -> str:
     """
-    Format a dictionary into a human-readable string.
-
+    Formats a dictionary into a string representation with each key-value pair.
     Args:
         d (dict): The dictionary to format.
-
     Returns:
-        str: The formatted string.
+        str: A string representation of the dictionary.
     """
-    return ', '.join(f'{k}: {v}' for k, v in d.items())
+    return ", ".join(f"{k}: {v}" for k, v in d.items())
 
-def format_tuple_list(t):
+
+def format_tuple_list(t: list) -> str:
     """
-    Format a list of tuples into a human-readable string.
-
+    Formats a list of tuples into a string.
     Args:
         t (list): The list of tuples.
-
     Returns:
-        str: The formatted string.
+        str: A comma-separated string of the tuples.
     """
     if t:
-        return ', '.join(f'{k}: {v}' for k, v in t)
-    return ''
+        return ", ".join(f"{k}: {v}" for k, v in t)
+    return ""
 
-def format_list(l):
+
+def format_list(l: list) -> str:
     """
-    Format a list into a human-readable string.
-
+    Converts a list into a comma-separated string.
     Args:
         l (list): The list to format.
-
     Returns:
-        str: The formatted string.
+        str: A comma-separated string of the list items.
     """
     if l:
-        return ', '.join(l)
-    return ''
+        return ", ".join(l)
+    return ""
 
-async def audit_tls_certificates(file_path):
-    """
-    Audit TLS certificates for the hosts and ports listed in the given file.
-
-    Args:
-        file_path (str): Path to the file containing host:port pairs.
-
-    Returns:
-        list: A list of tuples containing host, port, and the parsed certificate details or an error message.
-    """
+async def audit_tls_certificates(file_path: str) -> list:
     data = []
     loop = asyncio.get_event_loop()
-    with open(file_path, 'r') as file:
+    with open(file_path, "r") as file:
         tasks = []
         for line in file:
-            host, port = line.strip().split(':')
-            tasks.append(loop.run_in_executor(None, get_server_certificate, host, int(port)))
+            line = line.strip()
+            if ':' in line and line.count(':') > 1:  # Likely an IPv6 address
+                parts = line.rsplit('.', 1)  # Split from the right on the dot for port
+                if len(parts) == 2 and parts[1].isdigit():
+                    host, port = parts[0], int(parts[1])  # Separate the port
+                else:
+                    host, port = line, None  # No port specified, treat whole line as address
+            else:  # Likely an IPv4 address or hostname
+                parts = line.split(':')
+                if len(parts) == 2 and parts[1].isdigit():
+                    host, port = parts[0], int(parts[1])
+                else:
+                    host, port = line, None  # No port specified or improper format
+
+            tasks.append(loop.run_in_executor(None, get_server_certificate, host, port))
+
         responses = await asyncio.gather(*tasks)
         for response in responses:
             data.append(response)
     return data
 
-def check_certificate_expiry(not_after_str, days_threshold):
-    """
-    Check if the TLS certificate is expiring soon or already expired.
 
+def to_dataframe(data: list, days_threshold: int) -> pd.DataFrame:
+    """
+    Converts a list of certificate information into a pandas DataFrame.
     Args:
-        not_after_str (str): The 'notAfter' date from the TLS certificate.
-        days_threshold (int): The number of days before expiration to flag the certificate.
-
+        data (list): List of tuples containing certificate details.
+        days_threshold (int): Number of days to consider for expiring soon status.
     Returns:
-        tuple: A tuple containing two boolean values: expiring_soon, expired.
-    """
-    try:
-        not_after = datetime.strptime(not_after_str, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
-        current_date = datetime.now(timezone.utc)
-        days_until_expiry = (not_after - current_date).days
-        expired = days_until_expiry < 0
-        expiring_soon = expired or days_until_expiry <= days_threshold
-        return expiring_soon, expired
-    except Exception as e:
-        print(f"Error parsing 'notAfter' date: {not_after_str} - {e}")
-        return False, False
-
-def to_dataframe(data, days_threshold):
-    """
-    Convert TLS certificate data to a pandas DataFrame and add expiry columns.
-
-    Args:
-        data (list): The list of TLS certificate data tuples.
-        days_threshold (int): The number of days before expiration to flag certificates.
-
-    Returns:
-        pandas.DataFrame: A DataFrame containing the TLS certificate data.
+        pd.DataFrame: A DataFrame containing the certificate details with expiration flags.
     """
     records = []
-    for host, port, tls_info in data:
+    for host, port, tls_info, last_checked in data:
         if isinstance(tls_info, dict):
-            record = {'host': host, 'port': port}
+            record = {"host": host, "port": port}
             record.update(tls_info)
-            expiring_soon, expired = check_certificate_expiry(tls_info.get('notAfter', ''), days_threshold)
-            record['expiring_soon'] = expiring_soon
-            record['expired'] = expired
+            expiring_soon, expired = check_certificate_expiry(
+                tls_info["notAfter"].strftime("%b %d %H:%M:%S %Y %Z"), days_threshold
+            )
+            record["expiring_soon"] = expiring_soon
+            record["expired"] = expired
+            record["last_checked"] = last_checked
             records.append(record)
         else:
-            records.append({'host': host, 'port': port, 'error': tls_info, 'expiring_soon': None, 'expired': None})
+            records.append(
+                {
+                    "host": host,
+                    "port": port,
+                    "error": tls_info,
+                    "expiring_soon": None,
+                    "expired": None,
+                    "last_checked": last_checked,
+                }
+            )
     df = pd.DataFrame(records)
     return df
 
-def save_to_database(df, table_name):
-    """
-    Save the DataFrame to a PostgreSQL database table.
 
+def check_certificate_expiry(not_after_str: str, days_threshold: int) -> tuple:
+    """
+    Determines whether a certificate is expiring soon or has expired.
     Args:
-        df (pandas.DataFrame): The DataFrame to save.
-        table_name (str): The name of the database table.
+        not_after_str (str): The 'notAfter' date string from the certificate.
+        days_threshold (int): The threshold in days to determine if the certificate is expiring soon.
+    Returns:
+        tuple: Boolean values indicating if the certificate is expiring soon and if it has expired.
     """
-    db_name = os.getenv('DB_NAME')
-    user = os.getenv('DB_USER')
-    password = os.getenv('DB_PASSWORD')
-    host = os.getenv('DB_HOST')
-    port = os.getenv('DB_PORT')
-    conn = psycopg2.connect(database=db_name, user=user, password=password, host=host, port=port)
-    create_table_if_not_exists(conn, table_name)  # Ensure the table exists
-    df.to_sql(table_name, conn, if_exists='replace', index=False)
+    try:
+        not_after = datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z").replace(
+            tzinfo=timezone.utc
+        )
+        current_date = datetime.now(timezone.utc)
+        days_until_expiry = (not_after - current_date).days
+        expired = days_until_expiry < 0
+        expiring_soon = days_until_expiry <= days_threshold
+        return expiring_soon, expired
+    except Exception as e:
+        logger.error(f"Error parsing 'notAfter' date: {not_after_str} - {e}")
+        return False, False
 
-def create_table_if_not_exists(conn, table_name):
+
+def create_table_if_not_exists(connection, table_name: str):
     """
-    Create the table in PostgreSQL if it does not already exist.
-
+    Creates a database table if it does not already exist.
     Args:
-        conn: A psycopg2 connection object.
-        table_name (str): The name of the table to create.
+        connection: A SQLAlchemy connection object.
+        table_name (str): Name of the table to create.
     """
     create_table_sql = f"""
     CREATE TABLE IF NOT EXISTS {table_name} (
         host TEXT NOT NULL,
+        ptr TEXT,
+        description TEXT,
         port INTEGER NOT NULL,
         subject TEXT,
         commonName TEXT,
         issuer TEXT,
         version INTEGER,
         serialNumber TEXT,
-        notBefore TEXT,
-        notAfter TEXT,
+        notBefore TIMESTAMP WITH TIME ZONE,
+        notAfter TIMESTAMP WITH TIME ZONE,
         subjectAltName TEXT,
         OCSP TEXT,
         caIssuers TEXT,
@@ -231,76 +252,183 @@ def create_table_if_not_exists(conn, table_name):
         expiring_soon BOOLEAN,
         expired BOOLEAN,
         error TEXT,
+        last_checked TIMESTAMP WITH TIME ZONE,
         PRIMARY KEY (host, port)
     );
     """
-    with conn.cursor() as cursor:
-        cursor.execute(create_table_sql)
-        conn.commit()
+    logger.info(f"Creating table {table_name} if it does not exist.")
+    connection.execute(text(create_table_sql))
+    logger.info(f"Table {table_name} creation checked.")
 
-def save_to_file(df, file_path, file_type):
+
+def save_to_database(df: pd.DataFrame, table_name: str):
     """
-    Save the DataFrame to a file.
-
+    Saves the DataFrame to a PostgreSQL database.
     Args:
-        df (pandas.DataFrame): The DataFrame to save.
-        file_path (str): The path to save the file.
-        file_type (str): The type of file to save ('csv' or 'xls').
-
-    Raises:
-        ValueError: If the file type is not supported.
+        df (pd.DataFrame): The DataFrame containing the data to be saved.
+        table_name (str): The name of the database table to save the data.
     """
-    if file_type == 'csv':
+    db_name = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT")
+
+    # Logging the environment variables (excluding sensitive data)
+    logger.info(
+        f"DB_NAME: {db_name}, DB_USER: {user}, DB_HOST: {host}, DB_PORT: {port}"
+    )
+    logger.debug(f"DB_PASSWORD: {'set' if password else 'not set'}")
+
+    # Verify that the environment variables are correctly set
+    if not db_name or not user or not password or not host or not port:
+        raise ValueError(
+            "One or more environment variables for database connection are not set."
+        )
+
+    # Debug: Print the connection string (without the password)
+    logger.debug(
+        f"Connecting to postgresql+pg8000://{user}:<password>@{host}:{port}/{db_name}"
+    )
+
+    # Create the SQLAlchemy engine
+    engine = create_engine(
+        f"postgresql+pg8000://{user}:{password}@{host}:{port}/{db_name}"
+    )
+
+    try:
+        with engine.begin() as connection:
+            result = connection.execute(text("SELECT current_user;"))
+            current_user = result.fetchone()[0]
+            logger.info(f"Connected to the database as user: {current_user}")
+
+            result = connection.execute(
+                text("SELECT has_schema_privilege(current_user, 'public', 'CREATE');")
+            )
+            can_create = result.fetchone()[0]
+            if not can_create:
+                raise PermissionError(
+                    "User does not have CREATE permission on the public schema."
+                )
+            logger.info("User has CREATE permission on the public schema.")
+
+            create_table_if_not_exists(connection, f"public.{table_name}")
+
+            result = connection.execute(
+                text(f"SELECT to_regclass('public.{table_name}');")
+            )
+            table_exists = result.fetchone()[0]
+            if table_exists:
+                logger.info(f"Table public.{table_name} exists.")
+            else:
+                logger.error(
+                    f"Table public.{table_name} does not exist after creation attempt."
+                )
+                raise Exception(
+                    f"Table public.{table_name} does not exist after creation attempt."
+                )
+
+            df.to_sql(
+                table_name,
+                connection,
+                if_exists="replace",
+                index=False,
+                schema="public",
+            )
+            logger.info(f"Data inserted into table public.{table_name}.")
+
+            result = connection.execute(
+                text(f"SELECT COUNT(*) FROM public.{table_name};")
+            )
+            row_count = result.fetchone()[0]
+            logger.info(f"Number of rows in public.{table_name}: {row_count}")
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error saving to database: {e}")
+        raise
+
+
+def save_to_file(df: pd.DataFrame, file_path: str, file_type: str):
+    """
+    Saves the DataFrame to a file in the specified format.
+    Args:
+        df (pd.DataFrame): The DataFrame to save.
+        file_path (str): The path where the file will be saved.
+        file_type (str): The type of file to save ('csv' or 'xls').
+    """
+    if file_type == "csv":
         df.to_csv(file_path, index=False)
-    elif file_type == 'xls':
+    elif file_type == "xls":
         df.to_excel(file_path, index=False)
     else:
         raise ValueError("Unsupported file type. Use 'csv' or 'xls'.")
 
-def filter_dataframe(df, expiring_soon=None, expired=None, valid=None):
-    """
-    Filter the DataFrame based on the certificate status.
 
+def filter_dataframe(
+    df: pd.DataFrame,
+    expiring_soon: bool = None,
+    expired: bool = None,
+    valid: bool = None,
+) -> pd.DataFrame:
+    """
+    Filters the DataFrame based on certificate validity.
     Args:
-        df (pandas.DataFrame): The DataFrame to filter.
-        expiring_soon (bool): If True, filter to show only certificates that are expiring soon.
-        expired (bool): If True, filter to show only certificates that have expired.
-        valid (bool): If True, filter to show only certificates that are neither expiring soon nor expired.
-
+        df (pd.DataFrame): The DataFrame to filter.
+        expiring_soon (bool): If True, filters for certificates that are expiring soon.
+        expired (bool): If True, filters for certificates that have expired.
+        valid (bool): If True, filters for certificates that are valid.
     Returns:
-        pandas.DataFrame: The filtered DataFrame.
+        pd.DataFrame: The filtered DataFrame.
     """
-    df['expiring_soon'] = df['expiring_soon'].infer_objects()
-    df['expired'] = df['expired'].infer_objects()
-    
-    # Convert to boolean after ensuring types
-    df['expiring_soon'] = df['expiring_soon'].astype(bool, copy=False)
-    df['expired'] = df['expired'].astype(bool, copy=False)
-    
-    
+    df["expiring_soon"] = df["expiring_soon"].infer_objects()
+    df["expired"] = df["expired"].infer_objects()
+
+    df["expiring_soon"] = df["expiring_soon"].astype(bool, copy=False)
+    df["expired"] = df["expired"].astype(bool, copy=False)
+
     if expiring_soon:
-        df = df[df['expiring_soon']]
+        df = df[df["expiring_soon"]]
     if expired:
-        df = df[df['expired']]
+        df = df[df["expired"]]
     if valid:
-        df = df[~df['expiring_soon'] & ~df['expired']]
+        df = df[~df["expiring_soon"] & ~df["expired"]]
     return df
+
 
 def main():
     """
-    Main function to parse arguments and run the TLS certificate auditor.
+    Main function to execute the TLS certificate audit based on command-line arguments.
     """
-    parser = argparse.ArgumentParser(description='TLS Certificate Auditor')
-    parser.add_argument('--file', required=True, help='File containing IP addresses and ports')
-    parser.add_argument('--table', required=True, help='Table name to save data')
-    parser.add_argument('--postgres', action='store_true', help='Save data to PostgreSQL database')
-    parser.add_argument('--output', help='Output file path')
-    parser.add_argument('--type', choices=['csv', 'xls'], help='Output file type')
-    parser.add_argument('--stdout', action='store_true', help='Print data to stdout')
-    parser.add_argument('--days', type=int, default=30, help='Number of days to flag certificates nearing expiration')
-    parser.add_argument('--expiring_soon', action='store_true', help='Filter to show only expiring soon certificates')
-    parser.add_argument('--expired', action='store_true', help='Filter to show only expired certificates')
-    parser.add_argument('--valid', action='store_true', help='Filter to show only valid certificates')
+    parser = argparse.ArgumentParser(description="TLS Certificate Auditor")
+    parser.add_argument(
+        "--file", required=True, help="File containing IP addresses and ports"
+    )
+    parser.add_argument("--table", required=True, help="Table name to save data")
+    parser.add_argument(
+        "--postgres", action="store_true", help="Save data to PostgreSQL database"
+    )
+    parser.add_argument("--output", help="Output file path")
+    parser.add_argument("--type", choices=["csv", "xls"], help="Output file type")
+    parser.add_argument("--stdout", action="store_true", help="Print data to stdout")
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Number of days to flag certificates nearing expiration",
+    )
+    parser.add_argument(
+        "--expiring_soon",
+        action="store_true",
+        help="Filter to show only expiring soon certificates",
+    )
+    parser.add_argument(
+        "--expired",
+        action="store_true",
+        help="Filter to show only expired certificates",
+    )
+    parser.add_argument(
+        "--valid", action="store_true", help="Filter to show only valid certificates"
+    )
     args = parser.parse_args()
 
     data = asyncio.run(audit_tls_certificates(args.file))
@@ -314,8 +442,8 @@ def main():
     elif args.stdout:
         print(df.to_string())
     else:
-        print('Either --postgres, --output and --type, or --stdout must be specified')
+        print("Either --postgres, --output and --type, or --stdout must be specified")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
-
